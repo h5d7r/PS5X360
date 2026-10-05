@@ -1,0 +1,106 @@
+name: Build PPSA50011.zip
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, x64, ps5]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check VERSION matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          test "${GITHUB_REF_NAME#v}" = "$(tr -d '[:space:]' < VERSION)" \
+            || { echo "Tag $GITHUB_REF_NAME does not match VERSION $(cat VERSION)"; exit 1; }
+
+      - name: Check build tools
+        shell: bash
+        run: |
+          for tool in git cmake ninja python3 clang-18 clang++-18 llvm-nm-18; do
+            command -v "$tool" >/dev/null || { echo "Missing tool: $tool"; exit 1; }
+          done
+
+      - name: Check prepared toolchain
+        shell: bash
+        run: |
+          for path in \
+            .deps/references/PS5_Vulkan/tooling/native \
+            .deps/references/PS5_Vulkan/.deps/native/ps5-payload-sdk \
+            .deps/references/PS5_Vulkan/.deps/native/radv-release/lib/libvulkan_radeon.ps5.a \
+            build/native-runtime-stage/tools/verify-image.py \
+            build/native-runtime-stage/dist/PPSA50010/sce_module/libc.prx; do
+            [ -e "$path" ] || { echo "Missing toolchain piece: $path (see docs/BUILD.md)"; exit 1; }
+          done
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .deps/references
+            .deps/xenia-canary
+            build/native-runtime-stage
+          key: toolchain-${{ hashFiles('deps.json') }}
+
+      - name: Prepare pinned Xenia Canary
+        shell: bash
+        run: python3 tools/prepare_canary.py
+
+      - name: Build the native PS5 title
+        shell: bash
+        env:
+          PS5_PAYLOAD_SDK: .deps/references/PS5_Vulkan/.deps/native/ps5-payload-sdk
+          JOBS: 8
+        run: bash tools/build-canary-game.sh
+
+      - name: Package the release zip
+        shell: bash
+        run: python3 tools/package-release.py
+
+      - name: Verify the release zip
+        shell: bash
+        run: |
+          test -f dist/PPSA50011.zip || { echo "dist/PPSA50011.zip missing"; exit 1; }
+          test -f dist/PPSA50011.zip.sha256 || { echo "sha256 sidecar missing"; exit 1; }
+          expected=$(cut -d ' ' -f 1 dist/PPSA50011.zip.sha256)
+          actual=$(sha256sum dist/PPSA50011.zip | cut -d ' ' -f 1)
+          test "$expected" = "$actual" || { echo "SHA-256 mismatch"; exit 1; }
+          python3 - <<'PY'
+          import zipfile
+          names = zipfile.ZipFile('dist/PPSA50011.zip').namelist()
+          assert any(name == 'PPSA50011/eboot.bin' for name in names)
+          assert not [n for n in names if '/roms/' in n and not n.endswith('README.txt')]
+          print(f"zip OK: {len(names)} entries")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PPSA50011
+          path: |
+            dist/PPSA50011.zip
+            dist/PPSA50011.zip.sha256
+          retention-days: 14
+
+      - name: Publish the release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" dist/PPSA50011.zip dist/PPSA50011.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          version="$(tr -d '[:space:]' < VERSION)"
+          case "$version" in *-preview) gh release edit "$GITHUB_REF_NAME" --prerelease --repo "$GITHUB_REPOSITORY" ;; esac
